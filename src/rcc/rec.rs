@@ -390,6 +390,7 @@ peripheral_reset_and_enable_control! {
     APB4, "Advanced Peripheral Bus 4 (APB4) peripherals" => [
         Vref, Comp12,
 
+        Lpuart1 [kernel clk: Lpuart1(Variant) d3ccip "LPUART1"],
         Lptim2 [kernel clk: Lptim2(Variant) d3ccip "LPTIM2"],
         Lptim3 [group clk: Lptim345(Variant) d3ccip "LPTIM3/4/5"],
         Lptim4 [group clk: Lptim345],

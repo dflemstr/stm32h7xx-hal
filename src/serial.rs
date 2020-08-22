@@ -10,10 +10,11 @@ use embedded_hal::serial;
 use nb::block;
 
 use crate::stm32;
-use crate::stm32::rcc::d2ccip2r;
+use crate::stm32::rcc::{d2ccip2r, d3ccipr};
 use crate::stm32::usart1::cr1::{M0_A as M0, PCE_A as PCE, PS_A as PS};
 use stm32h7::Variant::Val;
 
+use crate::stm32::LPUART1;
 use crate::stm32::{UART4, UART5, UART7, UART8};
 use crate::stm32::{USART1, USART2, USART3, USART6};
 
@@ -32,7 +33,7 @@ use crate::gpio::gpioh::{PH13, PH14};
 use crate::gpio::gpioi::PI9;
 use crate::gpio::gpioj::{PJ8, PJ9};
 
-use crate::gpio::{Alternate, AF11, AF14, AF4, AF6, AF7, AF8};
+use crate::gpio::{Alternate, AF11, AF14, AF3, AF4, AF6, AF7, AF8};
 use crate::rcc::{rec, CoreClocks, ResetEnable};
 use crate::time::Hertz;
 
@@ -157,8 +158,11 @@ pub mod config {
 }
 
 pub trait Pins<USART> {}
+
 pub trait PinTx<USART> {}
+
 pub trait PinRx<USART> {}
+
 pub trait PinCk<USART> {}
 
 impl<USART, TX, RX> Pins<USART> for (TX, RX)
@@ -170,8 +174,10 @@ where
 
 /// A filler type for when the Tx pin is unnecessary
 pub struct NoTx;
+
 /// A filler type for when the Rx pin is unnecessary
 pub struct NoRx;
+
 /// A filler type for when the Ck pin is unnecessary
 pub struct NoCk;
 
@@ -332,6 +338,18 @@ uart_pins! {
             NoRx,
             PE0<Alternate<AF8>>,
             PJ9<Alternate<AF8>>
+        ]
+
+    LPUART1:
+        TX: [
+            NoTx,
+            PA9<Alternate<AF3>>,
+            PB6<Alternate<AF8>>
+        ]
+        RX: [
+            NoRx,
+            PA10<Alternate<AF3>>,
+            PB7<Alternate<AF8>>
         ]
 }
 
@@ -705,6 +723,271 @@ macro_rules! usart {
     }
 }
 
+/// Configures a LPUART peripheral to provide serial communication
+impl Serial<LPUART1> {
+    pub fn lpuart1(
+        lpuart: LPUART1,
+        config: config::Config,
+        prec: rec::Lpuart1,
+        clocks: &CoreClocks,
+    ) -> Result<Self, config::InvalidConfig> {
+        use self::config::*;
+
+        // Enable clock for USART and reset
+        prec.enable().reset();
+
+        // Get kernel clock
+        let usart_ker_ck = match Self::kernel_clk(clocks) {
+            Some(ker_hz) => ker_hz.0,
+            _ => panic!("LPUART1 kernel clock not running!"),
+        };
+
+        // Prescaler not used for now
+        let usart_ker_ck_presc = usart_ker_ck;
+        lpuart.presc.reset();
+
+        // Calculate baudrate divisor
+        let usartdiv = usart_ker_ck_presc / config.baudrate.0;
+        assert!(usartdiv <= 65_536);
+
+        // 16 times oversampling, OVER8 = 0
+        let brr = usartdiv as u32;
+        lpuart.brr.write(|w| unsafe { w.brr().bits(brr) });
+
+        // disable hardware flow control
+        // TODO enable DMA
+        // usart.cr3.write(|w| w.rtse().clear_bit().ctse().clear_bit());
+
+        // Reset registers to disable advanced USART features
+        lpuart.cr2.reset();
+        lpuart.cr3.reset();
+
+        // Set stop bits
+        lpuart.cr2.write(|w| unsafe {
+            w.stop().bits(match config.stopbits {
+                StopBits::STOP1 => 0,
+                StopBits::STOP2 => 1,
+                _ => panic!("unsupported stopbits, must be 1 or 2"),
+            })
+        });
+
+        // Enable transmission and receiving
+        // and configure frame
+        lpuart.cr1.write(|w| {
+            w.fifoen()
+                .set_bit() // FIFO mode enabled
+                .ue()
+                .set_bit()
+                .te()
+                .set_bit()
+                .re()
+                .set_bit()
+                .m1()
+                .clear_bit()
+                .m0()
+                .bit(match config.wordlength {
+                    WordLength::DataBits8 => false,
+                    WordLength::DataBits9 => true,
+                })
+                .pce()
+                .bit(match config.parity {
+                    Parity::ParityNone => false,
+                    _ => true,
+                })
+                .ps()
+                .bit(match config.parity {
+                    Parity::ParityOdd => false,
+                    _ => true,
+                })
+        });
+
+        Ok(Serial { usart: lpuart })
+    }
+
+    /// Starts listening for an interrupt event
+    pub fn listen(&mut self, event: Event) {
+        match event {
+            Event::Rxne => self.usart.cr1.modify(|_, w| w.rxneie().set_bit()),
+            Event::Txe => self.usart.cr1.modify(|_, w| w.txeie().set_bit()),
+            Event::Idle => self.usart.cr1.modify(|_, w| w.idleie().set_bit()),
+        }
+    }
+
+    /// Stop listening for an interrupt event
+    pub fn unlisten(&mut self, event: Event) {
+        match event {
+            Event::Rxne => self.usart.cr1.modify(|_, w| w.rxneie().clear_bit()),
+            Event::Txe => self.usart.cr1.modify(|_, w| w.txeie().clear_bit()),
+            Event::Idle => self.usart.cr1.modify(|_, w| w.idleie().clear_bit()),
+        }
+    }
+
+    /// Return true if the line idle status is set
+    pub fn is_idle(&self) -> bool {
+        unsafe { (*LPUART1::ptr()).isr.read().idle().bit_is_set() }
+    }
+
+    /// Return true if the tx register is empty (and can accept data)
+    pub fn is_txe(&self) -> bool {
+        unsafe { (*LPUART1::ptr()).isr.read().txe().bit_is_set() }
+    }
+
+    /// Return true if the rx register is not empty (and can be read)
+    pub fn is_rxne(&self) -> bool {
+        unsafe { (*LPUART1::ptr()).isr.read().rxne().bit_is_set() }
+    }
+
+    pub fn split(self) -> (Tx<LPUART1>, Rx<LPUART1>) {
+        (
+            Tx {
+                _usart: PhantomData,
+            },
+            Rx {
+                _usart: PhantomData,
+            },
+        )
+    }
+    /// Releases the USART peripheral
+    pub fn release(self) -> LPUART1 {
+        // Wait until both TXFIFO and shift register are empty
+        while self.usart.isr.read().tc().bit_is_clear() {}
+
+        self.usart
+    }
+}
+
+impl SerialExt<LPUART1> for LPUART1 {
+    type Rec = rec::Lpuart1;
+
+    fn serial(
+        self,
+        _pins: impl Pins<LPUART1>,
+        config: impl Into<config::Config>,
+        prec: rec::Lpuart1,
+        clocks: &CoreClocks,
+    ) -> Result<Serial<LPUART1>, config::InvalidConfig> {
+        Serial::lpuart1(self, config.into(), prec, clocks)
+    }
+
+    fn serial_unchecked(
+        self,
+        config: impl Into<config::Config>,
+        prec: rec::Lpuart1,
+        clocks: &CoreClocks,
+    ) -> Result<Serial<LPUART1>, config::InvalidConfig> {
+        Serial::lpuart1(self, config.into(), prec, clocks)
+    }
+}
+
+impl serial::Read<u8> for Serial<LPUART1> {
+    type Error = Error;
+
+    fn read(&mut self) -> nb::Result<u8, Error> {
+        let mut rx: Rx<LPUART1> = Rx {
+            _usart: PhantomData,
+        };
+        rx.read()
+    }
+}
+
+impl serial::Read<u8> for Rx<LPUART1> {
+    type Error = Error;
+
+    fn read(&mut self) -> nb::Result<u8, Error> {
+        // NOTE(unsafe) atomic read with no side effects
+        let isr = unsafe { (*LPUART1::ptr()).isr.read() };
+
+        Err(if isr.pe().bit_is_set() {
+            unsafe {
+                (*LPUART1::ptr()).icr.write(|w| w.pecf().clear_bit());
+            };
+            nb::Error::Other(Error::Parity)
+        } else if isr.fe().bit_is_set() {
+            unsafe {
+                (*LPUART1::ptr()).icr.write(|w| w.fecf().clear_bit());
+            };
+            nb::Error::Other(Error::Framing)
+        } else if isr.ore().bit_is_set() {
+            unsafe {
+                (*LPUART1::ptr()).icr.write(|w| w.orecf().clear_bit());
+            };
+            nb::Error::Other(Error::Overrun)
+        } else if isr.rxne().bit_is_set() {
+            // NOTE(read_volatile) see `write_volatile` below
+            return Ok(unsafe {
+                ptr::read_volatile(
+                    &(*LPUART1::ptr()).rdr as *const _ as *const _,
+                )
+            });
+        } else {
+            nb::Error::WouldBlock
+        })
+    }
+}
+
+impl serial::Write<u8> for Serial<LPUART1> {
+    type Error = Never;
+
+    fn flush(&mut self) -> nb::Result<(), Never> {
+        let mut tx: Tx<LPUART1> = Tx {
+            _usart: PhantomData,
+        };
+        tx.flush()
+    }
+
+    fn write(&mut self, byte: u8) -> nb::Result<(), Never> {
+        let mut tx: Tx<LPUART1> = Tx {
+            _usart: PhantomData,
+        };
+        tx.write(byte)
+    }
+}
+
+impl serial_block::write::Default<u8> for Serial<LPUART1> {
+    //implement marker trait to opt-in to default blocking write implementation
+}
+
+impl serial::Write<u8> for Tx<LPUART1> {
+    // NOTE(Void) See section "29.7 USART interrupts"; the
+    // only possible errors during transmission are: clear
+    // to send (which is disabled in this case) errors and
+    // framing errors (which only occur in SmartCard
+    // mode); neither of these apply to our hardware
+    // configuration
+    type Error = Never;
+
+    fn flush(&mut self) -> nb::Result<(), Never> {
+        // NOTE(unsafe) atomic read with no side effects
+        let isr = unsafe { (*LPUART1::ptr()).isr.read() };
+
+        if isr.tc().bit_is_set() {
+            Ok(())
+        } else {
+            Err(nb::Error::WouldBlock)
+        }
+    }
+
+    fn write(&mut self, byte: u8) -> nb::Result<(), Never> {
+        // NOTE(unsafe) atomic read with no side effects
+        let isr = unsafe { (*LPUART1::ptr()).isr.read() };
+
+        if isr.txe().bit_is_set() {
+            // NOTE(unsafe) atomic write to stateless register
+            // NOTE(write_volatile) 8-bit write that's not
+            // possible through the svd2rust API
+            unsafe {
+                ptr::write_volatile(
+                    &(*LPUART1::ptr()).tdr as *const _ as *mut _,
+                    byte,
+                )
+            }
+            Ok(())
+        } else {
+            Err(nb::Error::WouldBlock)
+        }
+    }
+}
+
 macro_rules! usart16sel {
 	($($USARTX:ident,)+) => {
 	    $(
@@ -771,6 +1054,25 @@ usart16sel! {
 }
 usart234578sel! {
     USART2, USART3, UART4, UART5, UART7, UART8,
+}
+
+impl Serial<LPUART1> {
+    /// Returns the frequency of the current kernel clock
+    /// for USART2/3, UART4/5/7/8
+    fn kernel_clk(clocks: &CoreClocks) -> Option<Hertz> {
+        // unsafe: read only
+        let d3ccipr = unsafe { (*stm32::RCC::ptr()).d3ccipr.read() };
+
+        match d3ccipr.lpuart1sel().variant() {
+            Val(d3ccipr::LPUART1SEL_A::RCC_PCLK_D3) => Some(clocks.pclk3()),
+            Val(d3ccipr::LPUART1SEL_A::PLL2_Q) => clocks.pll2_q_ck(),
+            Val(d3ccipr::LPUART1SEL_A::PLL3_Q) => clocks.pll3_q_ck(),
+            Val(d3ccipr::LPUART1SEL_A::HSI_KER) => clocks.hsi_ck(),
+            Val(d3ccipr::LPUART1SEL_A::CSI_KER) => clocks.csi_ck(),
+            Val(d3ccipr::LPUART1SEL_A::LSE) => unimplemented!(),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl<USART> fmt::Write for Tx<USART>
